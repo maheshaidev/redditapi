@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  redviddown-api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./downloads:/app/downloads
+      - ./temp:/app/temp
+    environment:
+      - REDDIT_CLIENT_ID=9P4xvnzTHN_SJBmUTtlR3g
+      - REDDIT_CLIENT_SECRET=vMKz8Hl0LgN19ju2fOI72ojckp80VA
+      - REDDIT_USER_AGENT=redviddown:v1.0.0 (by /u/redviddown)
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/test-connection"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
