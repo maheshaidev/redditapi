@@ -8,10 +8,15 @@ services:
     volumes:
       - ./downloads:/app/downloads
       - ./temp:/app/temp
+      - ./cookies.txt:/app/cookies.txt:ro
     environment:
       - REDDIT_CLIENT_ID=9P4xvnzTHN_SJBmUTtlR3g
       - REDDIT_CLIENT_SECRET=vMKz8Hl0LgN19ju2fOI72ojckp80VA
       - REDDIT_USER_AGENT=redviddown:v1.0.0 (by /u/redviddown)
+      # Optional: Add Reddit credentials for video downloads
+      - REDDIT_USERNAME=${REDDIT_USERNAME:-}
+      - REDDIT_PASSWORD=${REDDIT_PASSWORD:-}
+      - REDDIT_COOKIES_FILE=${REDDIT_COOKIES_FILE:-/app/cookies.txt}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/test-connection"]

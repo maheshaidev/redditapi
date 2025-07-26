@@ -33,9 +33,14 @@ app.add_middleware(
 )
 
 # Reddit API credentials
-REDDIT_CLIENT_ID = "9P4xvnzTHN_SJBmUTtlR3g"
-REDDIT_CLIENT_SECRET = "vMKz8Hl0LgN19ju2fOI72ojckp80VA"
-REDDIT_USER_AGENT = "redviddown:v1.0.0 (by /u/redviddown)"
+REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID", "9P4xvnzTHN_SJBmUTtlR3g")
+REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "vMKz8Hl0LgN19ju2fOI72ojckp80VA")
+REDDIT_USER_AGENT = os.getenv("REDDIT_USER_AGENT", "redviddown:v1.0.0 (by /u/redviddown)")
+
+# Reddit authentication for yt-dlp
+REDDIT_USERNAME = os.getenv("REDDIT_USERNAME")
+REDDIT_PASSWORD = os.getenv("REDDIT_PASSWORD")
+REDDIT_COOKIES_FILE = os.getenv("REDDIT_COOKIES_FILE", "/app/cookies.txt")
 
 # Directory setup
 BASE_DIR = Path(__file__).parent
@@ -123,8 +128,102 @@ class RedditAPI:
             return response.json()
         else:
             raise HTTPException(status_code=404, detail="Reddit post not found")
+    
+    async def get_video_urls_from_json(self, reddit_url: str):
+        """Get video URLs directly from Reddit JSON endpoint"""
+        try:
+            # Convert Reddit URL to JSON endpoint
+            if reddit_url.endswith('/'):
+                json_url = reddit_url[:-1] + '.json'
+            else:
+                json_url = reddit_url + '.json'
+            
+            headers = {'User-Agent': REDDIT_USER_AGENT}
+            response = requests.get(json_url, headers=headers)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                if data and len(data) > 0 and 'data' in data[0]:
+                    post_data = data[0]['data']['children'][0]['data']
+                    
+                    # Extract video information
+                    video_info = {
+                        'title': post_data.get('title', 'Reddit Video'),
+                        'author': post_data.get('author', 'Unknown'),
+                        'thumbnail': post_data.get('thumbnail', ''),
+                        'is_video': post_data.get('is_video', False),
+                        'video_urls': {},
+                        'audio_url': None
+                    }
+                    
+                    # Check for video in media
+                    media = post_data.get('media')
+                    if media and 'reddit_video' in media:
+                        reddit_video = media['reddit_video']
+                        
+                        # Get video URL (usually DASH format without audio)
+                        video_url = reddit_video.get('fallback_url')
+                        if video_url:
+                            video_info['video_urls']['fallback'] = video_url
+                            
+                            # Audio URL is typically the video URL with DASH_audio appended
+                            if 'DASH_' in video_url:
+                                audio_url = video_url.replace('DASH_', 'DASH_audio_')
+                                video_info['audio_url'] = audio_url
+                        
+                        # Get HLS URL if available
+                        hls_url = reddit_video.get('hls_url')
+                        if hls_url:
+                            video_info['video_urls']['hls'] = hls_url
+                        
+                        video_info['duration'] = reddit_video.get('duration', 0)
+                        video_info['height'] = reddit_video.get('height', 720)
+                        video_info['width'] = reddit_video.get('width', 1280)
+                    
+                    # Check for secure media (newer Reddit posts)
+                    secure_media = post_data.get('secure_media')
+                    if secure_media and 'reddit_video' in secure_media:
+                        reddit_video = secure_media['reddit_video']
+                        
+                        video_url = reddit_video.get('fallback_url')
+                        if video_url:
+                            video_info['video_urls']['secure_fallback'] = video_url
+                            
+                            if 'DASH_' in video_url:
+                                audio_url = video_url.replace('DASH_', 'DASH_audio_')
+                                video_info['audio_url'] = audio_url
+                    
+                    return video_info
+            
+            return None
+            
+        except Exception as e:
+            print(f"Error getting video URLs from JSON: {e}")
+            return None
 
 reddit_api = RedditAPI()
+
+def get_ytdlp_options_with_auth(base_opts: dict = None) -> dict:
+    """Get yt-dlp options with Reddit authentication"""
+    opts = base_opts.copy() if base_opts else {}
+    
+    # Add authentication options
+    if os.path.exists(REDDIT_COOKIES_FILE):
+        opts['cookiefile'] = REDDIT_COOKIES_FILE
+        print(f"Using cookies file: {REDDIT_COOKIES_FILE}")
+    elif REDDIT_USERNAME and REDDIT_PASSWORD:
+        opts['username'] = REDDIT_USERNAME
+        opts['password'] = REDDIT_PASSWORD
+        print("Using username/password authentication")
+    else:
+        print("Warning: No Reddit authentication configured. This may cause download failures.")
+    
+    # Add user agent for better compatibility
+    opts['http_headers'] = opts.get('http_headers', {})
+    opts['http_headers']['User-Agent'] = REDDIT_USER_AGENT
+    
+    return opts
 
 def extract_post_info_from_url(reddit_url: str) -> tuple[str, str]:
     """Extract post ID and subreddit from Reddit URL"""
@@ -247,7 +346,160 @@ def build_format_selector(formats, max_quality):
         ]
         return "/".join(quality_selectors)
 
-async def download_thumbnail(thumbnail_url: str, post_id: str) -> str:
+async def download_from_direct_urls(video_info: dict, temp_dir: Path, quality: str) -> Path:
+    """Download video using direct URLs from Reddit JSON"""
+    try:
+        video_urls = video_info.get('video_urls', {})
+        audio_url = video_info.get('audio_url')
+        title = clean_filename(video_info.get('title', 'Reddit Video'))
+        
+        if not video_urls:
+            raise Exception("No video URLs found")
+        
+        # Choose the best video URL
+        video_url = None
+        if 'secure_fallback' in video_urls:
+            video_url = video_urls['secure_fallback']
+        elif 'fallback' in video_urls:
+            video_url = video_urls['fallback']
+        elif 'hls' in video_urls:
+            video_url = video_urls['hls']
+        
+        if not video_url:
+            raise Exception("No suitable video URL found")
+        
+        print(f"Downloading video from: {video_url}")
+        
+        # Try to find better quality video URL if available
+        selected_quality = int(quality)
+        if selected_quality and "DASH_" in video_url:
+            try:
+                # Parse base URL
+                base_url = video_url.rsplit('/', 1)[0]
+                # Extract query parameters if any
+                query_params = ""
+                if "?" in video_url:
+                    query_params = "?" + video_url.split('?', 1)[1]
+                
+                # Try different quality versions
+                quality_options = [1080, 720, 480, 360, 240]
+                # Find closest available quality (start with requested or higher)
+                available_qualities = [q for q in quality_options if q <= selected_quality]
+                if not available_qualities:
+                    available_qualities = quality_options
+                
+                for test_quality in available_qualities:
+                    test_url = f"{base_url}/DASH_{test_quality}.mp4{query_params}"
+                    try:
+                        head_response = requests.head(test_url, 
+                                                    headers={'User-Agent': REDDIT_USER_AGENT},
+                                                    timeout=5)
+                        if head_response.status_code == 200:
+                            video_url = test_url
+                            print(f"Found better quality video: {test_quality}p")
+                            break
+                    except Exception as e:
+                        print(f"Failed to check quality {test_quality}p: {e}")
+            except Exception as e:
+                print(f"Error while trying to find better quality: {e}")
+        
+        # Download video
+        headers = {'User-Agent': REDDIT_USER_AGENT}
+        video_response = requests.get(video_url, headers=headers, stream=True)
+        
+        if video_response.status_code != 200:
+            raise Exception(f"Failed to download video: HTTP {video_response.status_code}")
+        
+        video_file = temp_dir / f"{title}_video.mp4"
+        with open(video_file, 'wb') as f:
+            for chunk in video_response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        
+        # Try to download audio if available
+        audio_file = None
+        if audio_url:
+            try:
+                print(f"Downloading audio from: {audio_url}")
+                audio_response = requests.get(audio_url, headers=headers, stream=True)
+                
+                if audio_response.status_code == 200:
+                    audio_file = temp_dir / f"{title}_audio.mp4"
+                    with open(audio_file, 'wb') as f:
+                        for chunk in audio_response.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                else:
+                    print(f"Audio download failed: HTTP {audio_response.status_code}")
+                    
+                    # Try alternative audio URL formats if the original fails
+                    if "DASH_" in video_url:
+                        # Try different audio URL patterns
+                        base_url = video_url.rsplit('/', 1)[0]
+                        audio_urls_to_try = [
+                            f"{base_url}/DASH_audio.mp4",
+                            f"{base_url}/audio",
+                            f"{base_url}/DASH_AUDIO_128.mp4",
+                            f"{base_url}/DASH_AUDIO_64.mp4"
+                        ]
+                        
+                        for alt_audio_url in audio_urls_to_try:
+                            try:
+                                print(f"Trying alternative audio URL: {alt_audio_url}")
+                                alt_response = requests.get(alt_audio_url, headers=headers, stream=True)
+                                if alt_response.status_code == 200:
+                                    audio_file = temp_dir / f"{title}_audio.mp4"
+                                    with open(audio_file, 'wb') as f:
+                                        for chunk in alt_response.iter_content(chunk_size=8192):
+                                            f.write(chunk)
+                                    if os.path.getsize(audio_file) > 1024:  # At least 1KB
+                                        print(f"Successfully downloaded audio from alternative URL")
+                                        break
+                            except Exception as e:
+                                print(f"Alternative audio URL failed: {e}")
+            except Exception as e:
+                print(f"Audio download error: {e}")
+        
+        # Merge video and audio if both exist
+        if audio_file and audio_file.exists() and video_file.exists():
+            try:
+                merged_file = temp_dir / f"{title}_merged.mp4"
+                
+                # Use ffmpeg to merge video and audio
+                merge_cmd = [
+                    'ffmpeg', '-i', str(video_file), '-i', str(audio_file),
+                    '-c:v', 'copy', '-c:a', 'aac', '-strict', 'experimental',
+                    str(merged_file), '-y'
+                ]
+                
+                result = subprocess.run(merge_cmd, capture_output=True, text=True)
+                
+                if result.returncode == 0 and merged_file.exists():
+                    print("Successfully merged video and audio")
+                    return merged_file
+                else:
+                    print(f"Merge failed: {result.stderr}")
+                    # Try alternate merge command
+                    alt_merge_cmd = [
+                        'ffmpeg', '-y',
+                        '-i', str(video_file),
+                        '-i', str(audio_file),
+                        '-c', 'copy',
+                        str(merged_file)
+                    ]
+                    alt_result = subprocess.run(alt_merge_cmd, capture_output=True, text=True)
+                    if alt_result.returncode == 0 and merged_file.exists():
+                        print("Successfully merged video and audio with alternate command")
+                        return merged_file
+                    else:
+                        return video_file
+            except Exception as e:
+                print(f"Merge error: {e}")
+                return video_file
+        else:
+            return video_file
+            
+    except Exception as e:
+        print(f"Direct download error: {e}")
+        raise
     """Download and save thumbnail image"""
     try:
         response = requests.get(thumbnail_url, timeout=10)
@@ -292,11 +544,11 @@ async def test_connection():
 async def debug_formats(request: VideoInfoRequest):
     """Debug endpoint to list all available formats for a Reddit URL"""
     try:
-        ydl_opts = {
+        ydl_opts = get_ytdlp_options_with_auth({
             'quiet': True,
             'no_warnings': True,
             'extract_flat': False,
-        }
+        })
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(request.url, download=False)
@@ -333,15 +585,39 @@ async def debug_formats(request: VideoInfoRequest):
 async def get_video_info(request: VideoInfoRequest):
     """Get video information from Reddit URL"""
     try:
-        # Extract post info from URL
+        # Try JSON endpoint first (no authentication needed)
+        video_data = await reddit_api.get_video_urls_from_json(request.url)
+        
+        if video_data and video_data.get('video_urls'):
+            # Determine available qualities based on video dimensions
+            height = video_data.get('height', 720)
+            qualities = []
+            
+            if height >= 1080:
+                qualities = ["1080", "720", "480", "360"]
+            elif height >= 720:
+                qualities = ["720", "480", "360"]
+            else:
+                qualities = ["480", "360", "240"]
+            
+            return VideoInfo(
+                title=video_data.get('title', 'Reddit Video'),
+                author=video_data.get('author', 'Unknown'),
+                thumbnail=video_data.get('thumbnail', ''),
+                duration=str(video_data.get('duration', '')),
+                qualities=qualities,
+                contentType="video"
+            )
+        
+        # Fallback to existing methods if JSON doesn't work
         post_id, subreddit = extract_post_info_from_url(request.url)
         
         # Create yt-dlp options for info extraction only
-        ydl_opts = {
+        ydl_opts = get_ytdlp_options_with_auth({
             'quiet': True,
             'no_warnings': True,
             'extract_flat': False,
-        }
+        })
         
         video_info = None
         
@@ -459,87 +735,161 @@ async def download_video(request: DownloadRequest, background_tasks: BackgroundT
         temp_dir = TEMP_DIR / download_id
         temp_dir.mkdir(exist_ok=True)
         
-        # Get available formats first
-        info_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'extract_flat': False,
-        }
+        # Try JSON endpoint first (no authentication needed)
+        video_data = await reddit_api.get_video_urls_from_json(request.url)
         
-        # Extract info to get available formats
-        with yt_dlp.YoutubeDL(info_opts) as ydl_info:
-            info = ydl_info.extract_info(request.url, download=False)
-            video_title = clean_filename(info.get('title', 'Reddit Video'))
-            
-            # Get available formats and find the best match
-            formats = info.get('formats', [])
-            
-            # Build format selector based on available formats
-            format_selector = build_format_selector(formats, int(request.quality))
-            
-            print(f"Using format selector: {format_selector}")
-        
-        # yt-dlp options for download
-        ydl_opts = {
-            'format': format_selector,
-            'outtmpl': str(temp_dir / '%(title)s.%(ext)s'),
-            'writesubtitles': False,
-            'writeautomaticsub': False,
-            'quiet': False,  # Enable output for debugging
-            'no_warnings': False,
-        }
-        
-        # Download video
         downloaded_file = None
+        video_title = "Reddit Video"
+        has_audio = False
         
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        if video_data and video_data.get('video_urls'):
+            print("Using direct JSON download method")
             try:
-                # Download the video
-                ydl.download([request.url])
+                downloaded_file = await download_from_direct_urls(video_data, temp_dir, request.quality)
+                video_title = clean_filename(video_data.get('title', 'Reddit Video'))
                 
-                # Find the downloaded file
-                for file_path in temp_dir.glob('*'):
-                    if file_path.is_file() and file_path.suffix.lower() in ['.mp4', '.webm', '.mkv', '.avi', '.mov']:
-                        downloaded_file = file_path
-                        break
-                        
-            except Exception as download_error:
-                print(f"Download failed with format selector: {format_selector}")
-                print(f"Error: {download_error}")
-                
-                # Try with a more generic format selector
-                fallback_opts = ydl_opts.copy()
-                fallback_opts['format'] = 'best[ext=mp4]/best'
-                
-                print("Trying fallback format: best[ext=mp4]/best")
-                
-                with yt_dlp.YoutubeDL(fallback_opts) as ydl_fallback:
-                    try:
-                        ydl_fallback.download([request.url])
+                # Check if the file has audio
+                try:
+                    probe_cmd = [
+                        'ffprobe', '-v', 'quiet', '-select_streams', 'a',
+                        '-show_entries', 'stream=codec_name', '-of', 'csv=p=0',
+                        str(downloaded_file)
+                    ]
+                    audio_result = subprocess.run(probe_cmd, capture_output=True, text=True)
+                    has_audio = bool(audio_result.stdout.strip())
+                except Exception as e:
+                    print(f"Audio check failed: {e}")
+                    has_audio = video_data.get('audio_url') is not None
+            except Exception as e:
+                print(f"Direct download failed: {e}")
+                downloaded_file = None
+        
+        # Fallback to yt-dlp if direct download fails
+        if not downloaded_file:
+            print("Falling back to yt-dlp method")
+            
+            # Get available formats first
+            info_opts = get_ytdlp_options_with_auth({
+                'quiet': True,
+                'no_warnings': True,
+                'extract_flat': False,
+                # Skip authentication requirement
+                'extractor_args': {
+                    'reddit': {
+                        'skip_auth': True
+                    }
+                }
+            })
+            
+            # Try to extract info without downloading
+            try:
+                with yt_dlp.YoutubeDL(info_opts) as ydl_info:
+                    info = ydl_info.extract_info(request.url, download=False)
+                    video_title = clean_filename(info.get('title', 'Reddit Video'))
+                    
+                    # Build format selector based on available formats
+                    formats = info.get('formats', [])
+                    format_selector = build_format_selector(formats, int(request.quality))
+                    
+                    # yt-dlp options for download
+                    ydl_opts = get_ytdlp_options_with_auth({
+                        'format': format_selector,
+                        'outtmpl': str(temp_dir / '%(title)s.%(ext)s'),
+                        'writesubtitles': False,
+                        'writeautomaticsub': False,
+                        'quiet': False,
+                        'no_warnings': False,
+                        # Skip authentication requirement
+                        'extractor_args': {
+                            'reddit': {
+                                'skip_auth': True
+                            }
+                        }
+                    })
+                    
+                    # Try to download
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([request.url])
                         
                         # Find the downloaded file
                         for file_path in temp_dir.glob('*'):
                             if file_path.is_file() and file_path.suffix.lower() in ['.mp4', '.webm', '.mkv', '.avi', '.mov']:
                                 downloaded_file = file_path
                                 break
-                                
-                    except Exception as fallback_error:
-                        print(f"Fallback download also failed: {fallback_error}")
+            except Exception as info_error:
+                print(f"yt-dlp info extraction failed: {info_error}")
+                
+                # Try direct download with more aggressive options
+                try:
+                    # Try to parse video ID from URL
+                    parsed_url = urlparse(request.url)
+                    path_parts = parsed_url.path.strip('/').split('/')
+                    post_id = None
+                    
+                    if 'comments' in path_parts and len(path_parts) > path_parts.index('comments') + 1:
+                        post_id = path_parts[path_parts.index('comments') + 1]
+                    elif 'v.redd.it' in parsed_url.netloc and path_parts:
+                        post_id = path_parts[0]
+                    
+                    if post_id:
+                        # Try to access Reddit JSON directly
+                        json_url = f"https://www.reddit.com/comments/{post_id}/.json"
+                        headers = {'User-Agent': REDDIT_USER_AGENT}
                         
-                        # Final fallback - just get the best available
-                        final_opts = ydl_opts.copy()
-                        final_opts['format'] = 'best'
+                        response = requests.get(json_url, headers=headers)
+                        if response.status_code == 200:
+                            try:
+                                data = response.json()
+                                if data and len(data) > 0 and 'data' in data[0]:
+                                    post_data = data[0]['data']['children'][0]['data']
+                                    
+                                    # Extract video URLs
+                                    if post_data.get('is_video', False):
+                                        media = post_data.get('media', {})
+                                        if media and 'reddit_video' in media:
+                                            reddit_video = media['reddit_video']
+                                            video_url = reddit_video.get('fallback_url')
+                                            
+                                            if video_url:
+                                                # Guess audio URL
+                                                audio_url = None
+                                                if 'DASH_' in video_url:
+                                                    audio_url = video_url.replace('DASH_', 'DASH_audio_')
+                                                
+                                                # Create temporary structure for download_from_direct_urls
+                                                direct_video_info = {
+                                                    'title': post_data.get('title', 'Reddit Video'),
+                                                    'video_urls': {'fallback': video_url},
+                                                    'audio_url': audio_url
+                                                }
+                                                
+                                                downloaded_file = await download_from_direct_urls(direct_video_info, temp_dir, request.quality)
+                                                video_title = clean_filename(post_data.get('title', 'Reddit Video'))
+                            except Exception as json_parse_error:
+                                print(f"JSON parse error: {json_parse_error}")
+                except Exception as direct_fallback_error:
+                    print(f"Direct fallback error: {direct_fallback_error}")
+                
+                # As a last resort, try generic yt-dlp options
+                if not downloaded_file:
+                    try:
+                        ydl_opts = get_ytdlp_options_with_auth({
+                            'format': 'best[ext=mp4]/best',
+                            'outtmpl': str(temp_dir / '%(title)s.%(ext)s'),
+                            'quiet': False,
+                            'no_warnings': False
+                        })
                         
-                        print("Trying final fallback format: best")
-                        
-                        with yt_dlp.YoutubeDL(final_opts) as ydl_final:
-                            ydl_final.download([request.url])
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            ydl.download([request.url])
                             
                             # Find the downloaded file
                             for file_path in temp_dir.glob('*'):
                                 if file_path.is_file() and file_path.suffix.lower() in ['.mp4', '.webm', '.mkv', '.avi', '.mov']:
                                     downloaded_file = file_path
                                     break
+                    except Exception as final_error:
+                        print(f"Final fallback download failed: {final_error}")
         
         if not downloaded_file or not downloaded_file.exists():
             raise HTTPException(status_code=500, detail="Failed to download video")
@@ -548,62 +898,41 @@ async def download_video(request: DownloadRequest, background_tasks: BackgroundT
         final_filename = f"{video_title}_{request.quality}p.mp4"
         final_path = DOWNLOADS_DIR / f"{download_id}_{final_filename}"
         
-        # Check if we need to merge video and audio or just copy
-        try:
-            # Get video info to check for separate audio
-            probe_cmd = [
-                'ffprobe', '-v', 'quiet', '-print_format', 'json', 
-                '-show_streams', str(downloaded_file)
-            ]
-            
-            result = subprocess.run(probe_cmd, capture_output=True, text=True)
-            
-            if result.returncode == 0:
-                probe_data = json.loads(result.stdout)
-                streams = probe_data.get('streams', [])
+        # Check audio streams if not already determined
+        if not has_audio:
+            try:
+                # Get video info to check for separate audio
+                probe_cmd = [
+                    'ffprobe', '-v', 'quiet', '-print_format', 'json', 
+                    '-show_streams', str(downloaded_file)
+                ]
                 
-                has_video = any(s.get('codec_type') == 'video' for s in streams)
-                has_audio = any(s.get('codec_type') == 'audio' for s in streams)
+                result = subprocess.run(probe_cmd, capture_output=True, text=True)
                 
-                if has_video and has_audio:
-                    # File already has both video and audio, just copy
-                    shutil.copy2(downloaded_file, final_path)
-                else:
-                    # Might need to merge - try yt-dlp with audio merge
-                    ydl_opts_with_audio = {
-                        'format': 'bestvideo+bestaudio/best',
-                        'outtmpl': str(temp_dir / 'merged_%(title)s.%(ext)s'),
-                        'merge_output_format': 'mp4',
-                        'quiet': True,
-                        'no_warnings': True,
-                    }
+                if result.returncode == 0:
+                    probe_data = json.loads(result.stdout)
+                    streams = probe_data.get('streams', [])
                     
-                    with yt_dlp.YoutubeDL(ydl_opts_with_audio) as ydl_merge:
-                        ydl_merge.download([request.url])
+                    has_video = any(s.get('codec_type') == 'video' for s in streams)
+                    has_audio = any(s.get('codec_type') == 'audio' for s in streams)
                     
-                    # Find merged file
-                    merged_file = None
-                    for file_path in temp_dir.glob('merged_*'):
-                        if file_path.is_file():
-                            merged_file = file_path
-                            break
-                    
-                    if merged_file and merged_file.exists():
-                        shutil.copy2(merged_file, final_path)
-                        has_audio = True
-                    else:
-                        # Fallback to original file
+                    if has_video and has_audio:
+                        # File already has both video and audio, just copy
                         shutil.copy2(downloaded_file, final_path)
-            else:
-                # Fallback if ffprobe fails
+                    else:
+                        # Copy anyway, already tried our best for audio
+                        shutil.copy2(downloaded_file, final_path)
+                else:
+                    # Fallback if ffprobe fails
+                    shutil.copy2(downloaded_file, final_path)
+                    has_audio = True  # Assume it has audio
+            except Exception as e:
+                print(f"Audio check failed: {e}")
                 shutil.copy2(downloaded_file, final_path)
                 has_audio = True  # Assume it has audio
-        
-        except Exception as e:
-            print(f"Audio merge attempt failed: {e}")
-            # Just copy the original file
+        else:
+            # Direct download already handled audio, just copy
             shutil.copy2(downloaded_file, final_path)
-            has_audio = True
         
         # Get file size
         file_size = final_path.stat().st_size
